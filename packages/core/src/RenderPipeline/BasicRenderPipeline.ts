@@ -1,9 +1,7 @@
-import { Vector2 } from "@galacean/engine-math";
-import { SpriteMask } from "../2d";
+import { Vector2, Vector4 } from "@galacean/engine-math";
 import { Background } from "../Background";
 import { Camera } from "../Camera";
-import { DisorderedArray } from "../DisorderedArray";
-import { Engine } from "../Engine";
+import { Logger } from "../base/Logger";
 import { BackgroundMode } from "../enums/BackgroundMode";
 import { BackgroundTextureFillMode } from "../enums/BackgroundTextureFillMode";
 import { CameraClearFlags } from "../enums/CameraClearFlags";
@@ -15,13 +13,22 @@ import { RenderQueueType } from "../shader/enums/RenderQueueType";
 import { RenderState } from "../shader/state/RenderState";
 import { CascadedShadowCasterPass } from "../shadow/CascadedShadowCasterPass";
 import { ShadowType } from "../shadow/enum/ShadowType";
-import { RenderTarget, Texture2D, TextureCubeFace, TextureFormat, TextureWrapMode } from "../texture";
+import {
+  RenderTarget,
+  Texture2D,
+  TextureCubeFace,
+  TextureFilterMode,
+  TextureFormat,
+  TextureWrapMode
+} from "../texture";
+import { Blitter } from "./Blitter";
 import { CullingResults } from "./CullingResults";
 import { DepthOnlyPass } from "./DepthOnlyPass";
 import { OpaqueTexturePass } from "./OpaqueTexturePass";
 import { PipelineUtils } from "./PipelineUtils";
-import { RenderContext } from "./RenderContext";
-import { RenderData } from "./RenderData";
+import { ContextRendererUpdateFlag, RenderContext } from "./RenderContext";
+import { RenderElement } from "./RenderElement";
+import { SubRenderElement } from "./SubRenderElement";
 import { PipelineStage } from "./enums/PipelineStage";
 
 /**
@@ -31,9 +38,6 @@ export class BasicRenderPipeline {
   /** @internal */
   _cullingResults: CullingResults;
 
-  /** @internal */
-  _allSpriteMasks: DisorderedArray<SpriteMask> = new DisorderedArray();
-
   private _camera: Camera;
   private _lastCanvasSize = new Vector2();
 
@@ -41,6 +45,10 @@ export class BasicRenderPipeline {
   private _cascadedShadowCasterPass: CascadedShadowCasterPass;
   private _depthOnlyPass: DepthOnlyPass;
   private _opaqueTexturePass: OpaqueTexturePass;
+  private _grabTexture: Texture2D;
+  private _canUseBlitFrameBuffer = false;
+  private _shouldGrabColor = false;
+  private _sourceScaleOffset = new Vector4(1, 1, 0, 0);
 
   /**
    * Create a basic render pipeline.
@@ -49,7 +57,7 @@ export class BasicRenderPipeline {
   constructor(camera: Camera) {
     this._camera = camera;
     const { engine } = camera;
-    this._cullingResults = new CullingResults(engine);
+    this._cullingResults = new CullingResults();
     this._cascadedShadowCasterPass = new CascadedShadowCasterPass(camera);
     this._depthOnlyPass = new DepthOnlyPass(engine);
     this._opaqueTexturePass = new OpaqueTexturePass(engine);
@@ -60,7 +68,6 @@ export class BasicRenderPipeline {
    */
   destroy(): void {
     this._cullingResults.destroy();
-    this._allSpriteMasks = null;
     this._camera = null;
   }
 
@@ -72,69 +79,116 @@ export class BasicRenderPipeline {
    * @param ignoreClear - Ignore clear flag
    */
   render(context: RenderContext, cubeFace?: TextureCubeFace, mipLevel?: number, ignoreClear?: CameraClearFlags) {
+    context.rendererUpdateFlag = ContextRendererUpdateFlag.All;
+
     const camera = this._camera;
     const { scene, engine } = camera;
+    const rhi = engine._hardwareRenderer;
     const cullingResults = this._cullingResults;
     const sunlight = scene._lightManager._sunlight;
     const depthOnlyPass = this._depthOnlyPass;
     const depthPassEnabled = camera.depthTextureMode === DepthTextureMode.PrePass && depthOnlyPass._supportDepthTexture;
-    camera.engine._spriteMaskManager.clear();
+    const finalClearFlags = camera.clearFlags & ~(ignoreClear ?? CameraClearFlags.None);
+    const independentCanvasEnabled = camera.independentCanvasEnabled;
+    const msaaSamples = camera.renderTarget ? camera.renderTarget.antiAliasing : camera.msaaSamples;
+    this._shouldGrabColor = independentCanvasEnabled && !(finalClearFlags & CameraClearFlags.Color);
+    // 1. Only support blitFramebuffer in webgl2 context
+    // 2. Can't blit normal FBO to MSAA FBO
+    // 3. Can't blit screen MSAA FBO to normal FBO in mac safari platform and mobile, but mac chrome and firfox is OK
+    this._canUseBlitFrameBuffer =
+      rhi.isWebGL2 && msaaSamples === 1 && (!!camera.renderTarget || !rhi.context.antialias);
 
     if (scene.castShadows && sunlight && sunlight.shadowType !== ShadowType.None) {
       this._cascadedShadowCasterPass.onRender(context);
+      context.rendererUpdateFlag = ContextRendererUpdateFlag.None;
     }
 
+    const batcherManager = engine._batcherManager;
     cullingResults.reset();
-    this._allSpriteMasks.length = 0;
 
+    // Depth use camera's view and projection matrix
+    context.rendererUpdateFlag |= ContextRendererUpdateFlag.viewProjectionMatrix;
     context.applyVirtualCamera(camera._virtualCamera, depthPassEnabled);
     this._prepareRender(context);
 
-    cullingResults.sort();
+    cullingResults.sortBatch(batcherManager);
+    batcherManager.uploadBuffer();
 
     if (depthPassEnabled) {
       depthOnlyPass.onConfig(camera);
       depthOnlyPass.onRender(context, cullingResults);
+      context.rendererUpdateFlag = ContextRendererUpdateFlag.None;
     } else {
       camera.shaderData.setTexture(Camera._cameraDepthTextureProperty, engine._basicResources.whiteTexture2D);
     }
 
-    // Check if need to create internal color texture
-    const independentCanvasEnabled = camera.independentCanvasEnabled;
+    // Check if need to create internal color texture or grab texture
     if (independentCanvasEnabled) {
+      let depthFormat: TextureFormat;
+      if (camera.renderTarget) {
+        depthFormat = camera.renderTarget._depthFormat;
+      } else if (rhi.context.depth && rhi.context.stencil) {
+        depthFormat = TextureFormat.Depth24Stencil8;
+      } else if (rhi.context.depth) {
+        depthFormat = TextureFormat.Depth24;
+      } else if (rhi.context.stencil) {
+        depthFormat = TextureFormat.Stencil;
+      } else {
+        depthFormat = null;
+      }
       const viewport = camera.pixelViewport;
       const internalColorTarget = PipelineUtils.recreateRenderTargetIfNeeded(
         engine,
         this._internalColorTarget,
         viewport.width,
         viewport.height,
-        TextureFormat.R8G8B8A8,
-        TextureFormat.Depth24Stencil8,
+        camera._getInternalColorTextureFormat(),
+        depthFormat,
         false,
         false,
-        camera.msaaSamples
+        msaaSamples,
+        TextureWrapMode.Clamp,
+        TextureFilterMode.Bilinear
       );
-      const colorTexture = internalColorTarget.getColorTexture(0);
-      colorTexture.wrapModeU = colorTexture.wrapModeV = TextureWrapMode.Clamp;
+
+      if (!this._canUseBlitFrameBuffer && this._shouldGrabColor) {
+        const grabTexture = PipelineUtils.recreateTextureIfNeeded(
+          engine,
+          this._grabTexture,
+          viewport.width,
+          viewport.height,
+          camera.renderTarget?.getColorTexture(0).format ?? TextureFormat.R8G8B8A8,
+          false,
+          TextureWrapMode.Clamp,
+          TextureFilterMode.Bilinear
+        );
+        this._grabTexture = grabTexture;
+      }
+
       this._internalColorTarget = internalColorTarget;
     } else {
       const internalColorTarget = this._internalColorTarget;
+      const grabTexture = this._grabTexture;
       if (internalColorTarget) {
         internalColorTarget.getColorTexture(0)?.destroy(true);
         internalColorTarget.destroy(true);
         this._internalColorTarget = null;
       }
+      if (grabTexture) {
+        grabTexture.destroy(true);
+        this._grabTexture = null;
+      }
     }
 
-    this._drawRenderPass(context, camera, cubeFace, mipLevel, ignoreClear);
+    this._drawRenderPass(context, camera, finalClearFlags, cubeFace, mipLevel);
   }
 
   private _drawRenderPass(
     context: RenderContext,
     camera: Camera,
+    finalClearFlags: CameraClearFlags,
     cubeFace?: TextureCubeFace,
-    mipLevel?: number,
-    ignoreClear?: CameraClearFlags
+    mipLevel?: number
   ) {
     const cullingResults = this._cullingResults;
     const { opaqueQueue, alphaTestQueue, transparentQueue } = cullingResults;
@@ -142,33 +196,74 @@ export class BasicRenderPipeline {
     const { engine, scene } = camera;
     const { background } = scene;
 
-    const internalColorTarget = this._internalColorTarget;
     const rhi = engine._hardwareRenderer;
-    const colorTarget = camera.renderTarget ?? internalColorTarget;
+    const internalColorTarget = this._internalColorTarget;
+    const colorTarget = internalColorTarget || camera.renderTarget;
     const colorViewport = internalColorTarget ? PipelineUtils.defaultViewport : camera.viewport;
-    const needFlipProjection = (camera.renderTarget && cubeFace == undefined) || internalColorTarget !== null;
+    const needFlipProjection = !!internalColorTarget || (camera.renderTarget && cubeFace == undefined);
 
     if (context.flipProjection !== needFlipProjection) {
+      // Just add projection matrix update type is enough
+      context.rendererUpdateFlag |= ContextRendererUpdateFlag.ProjectionMatrix;
       context.applyVirtualCamera(camera._virtualCamera, needFlipProjection);
-      this._updateMVPShaderData(context);
-      // @todo: It is more appropriate to prevent duplication based on `virtualCamera` at `RenderQueue#render`.
-      engine._renderCount++;
     }
 
     rhi.activeRenderTarget(colorTarget, colorViewport, context.flipProjection, mipLevel, cubeFace);
-    const clearFlags = camera.clearFlags & ~(ignoreClear ?? CameraClearFlags.None);
     const color = background.solidColor;
-    if (clearFlags !== CameraClearFlags.None) {
-      rhi.clearRenderTarget(camera.engine, clearFlags, color);
+
+    if (internalColorTarget && finalClearFlags !== CameraClearFlags.All) {
+      // Can use `blitFramebuffer` API to copy color/depth/stencil buffer from back buffer to internal RT
+      if (this._canUseBlitFrameBuffer) {
+        finalClearFlags !== CameraClearFlags.None && rhi.clearRenderTarget(engine, finalClearFlags, color);
+        rhi.blitInternalRTByBlitFrameBuffer(camera.renderTarget, internalColorTarget, finalClearFlags, camera.viewport);
+      } else {
+        if (!(finalClearFlags & CameraClearFlags.Depth) || !(finalClearFlags & CameraClearFlags.Stencil)) {
+          Logger.warn(
+            "We clear all depth/stencil state cause of the internalRT can't copy depth/stencil buffer from back buffer when use copy plan"
+          );
+        }
+
+        if (this._shouldGrabColor) {
+          rhi.clearRenderTarget(engine, CameraClearFlags.DepthStencil);
+          // Copy RT's color buffer to grab texture
+          rhi.copyRenderTargetToSubTexture(camera.renderTarget, this._grabTexture, camera.viewport);
+          // Then blit grab texture to internal RT's color buffer
+          const sourceScaleOffset = this._sourceScaleOffset;
+          sourceScaleOffset.y = camera.renderTarget ? 1 : -1;
+          sourceScaleOffset.w = camera.renderTarget ? 0 : 1;
+          // `uv.y = 1.0 - uv.y` if grab from screen
+          Blitter.blitTexture(
+            engine,
+            this._grabTexture,
+            internalColorTarget,
+            0,
+            undefined,
+            undefined,
+            undefined,
+            sourceScaleOffset
+          );
+        } else {
+          rhi.clearRenderTarget(engine, CameraClearFlags.All, color);
+        }
+      }
+
+      rhi.activeRenderTarget(colorTarget, colorViewport, context.flipProjection, mipLevel, cubeFace);
+    } else if (finalClearFlags !== CameraClearFlags.None) {
+      rhi.clearRenderTarget(engine, finalClearFlags, color);
     }
 
-    opaqueQueue.render(camera, PipelineStage.Forward);
-    alphaTestQueue.render(camera, PipelineStage.Forward);
-    if (clearFlags & CameraClearFlags.Color) {
+    const maskManager = scene._maskManager;
+    if (finalClearFlags & CameraClearFlags.Stencil) {
+      maskManager.hasStencilWritten = false;
+    }
+
+    opaqueQueue.render(context, PipelineStage.Forward);
+    alphaTestQueue.render(context, PipelineStage.Forward);
+    if (finalClearFlags & CameraClearFlags.Color) {
       if (background.mode === BackgroundMode.Sky) {
         background.sky._render(context);
       } else if (background.mode === BackgroundMode.Texture && background.texture) {
-        this._drawBackgroundTexture(engine, background);
+        this._drawBackgroundTexture(camera, background);
       }
     }
 
@@ -179,7 +274,7 @@ export class BasicRenderPipeline {
 
       const opaqueTexturePass = this._opaqueTexturePass;
       opaqueTexturePass.onConfig(camera, colorTarget.getColorTexture(0));
-      opaqueTexturePass.onRender(context, cullingResults);
+      opaqueTexturePass.onRender(context);
 
       // Should revert to original render target
       rhi.activeRenderTarget(colorTarget, colorViewport, context.flipProjection, mipLevel, cubeFace);
@@ -187,85 +282,121 @@ export class BasicRenderPipeline {
       camera.shaderData.setTexture(Camera._cameraOpaqueTextureProperty, null);
     }
 
-    transparentQueue.render(camera, PipelineStage.Forward);
+    transparentQueue.render(context, PipelineStage.Forward);
+    // Revert stencil buffer generated by mask
+    maskManager.clearMask(context, PipelineStage.Forward);
 
-    colorTarget?._blitRenderTarget();
-    colorTarget?.generateMipmaps();
-
-    if (internalColorTarget) {
-      PipelineUtils.blitTexture(engine, <Texture2D>internalColorTarget.getColorTexture(0), null, 0, camera.viewport);
+    const postProcessManager = scene.postProcessManager;
+    const cameraRenderTarget = camera.renderTarget;
+    if (camera.enablePostProcess && postProcessManager._isValid()) {
+      postProcessManager._render(camera, internalColorTarget, cameraRenderTarget);
+    } else {
+      postProcessManager._releaseSwapRenderTarget();
+      if (internalColorTarget) {
+        internalColorTarget._blitRenderTarget();
+        Blitter.blitTexture(
+          engine,
+          <Texture2D>internalColorTarget.getColorTexture(0),
+          cameraRenderTarget,
+          0,
+          camera.viewport
+        );
+      }
     }
+
+    cameraRenderTarget?._blitRenderTarget();
+    cameraRenderTarget?.generateMipmaps();
   }
 
   /**
    * Push render data to render queue.
    * @param context - Render context
-   * @param data - Render data
+   * @param renderElement - Render element
    */
-  pushRenderData(context: RenderContext, data: RenderData): void {
-    const { material } = data;
-    const { renderStates } = material;
-    const materialSubShader = material.shader.subShaders[0];
-    const replacementShader = context.replacementShader;
-
-    if (replacementShader) {
-      const replacementSubShaders = replacementShader.subShaders;
-      const { replacementTag } = context;
-      if (replacementTag) {
-        const materialSubShaderTagValue = materialSubShader.getTagValue(replacementTag);
-        for (let i = 0, n = replacementSubShaders.length; i < n; i++) {
-          const subShader = replacementSubShaders[i];
-          if (subShader.getTagValue(replacementTag) === materialSubShaderTagValue) {
-            this.pushRenderDataWithShader(context, data, subShader.passes, renderStates);
-            return;
+  pushRenderElement(context: RenderContext, renderElement: RenderElement): void {
+    renderElement.renderQueueFlags = RenderQueueFlags.None;
+    const subRenderElements = renderElement.subRenderElements;
+    for (let i = 0, n = subRenderElements.length; i < n; ++i) {
+      const subRenderElement = subRenderElements[i];
+      const { material } = subRenderElement;
+      const { renderStates } = material;
+      const materialSubShader = material.shader.subShaders[0];
+      const replacementShader = context.replacementShader;
+      if (replacementShader) {
+        const replacementSubShaders = replacementShader.subShaders;
+        const { replacementTag } = context;
+        if (replacementTag) {
+          let replacementSuccess = false;
+          for (let j = 0, m = replacementSubShaders.length; j < m; j++) {
+            const subShader = replacementSubShaders[j];
+            if (subShader.getTagValue(replacementTag) === materialSubShader.getTagValue(replacementTag)) {
+              this.pushRenderElementByType(renderElement, subRenderElement, subShader.passes, renderStates);
+              replacementSuccess = true;
+            }
           }
+
+          if (
+            !replacementSuccess &&
+            context.replacementFailureStrategy === ReplacementFailureStrategy.KeepOriginalShader
+          ) {
+            this.pushRenderElementByType(renderElement, subRenderElement, materialSubShader.passes, renderStates);
+          }
+        } else {
+          this.pushRenderElementByType(renderElement, subRenderElement, replacementSubShaders[0].passes, renderStates);
         }
-        context.replacementFailureStrategy === ReplacementFailureStrategy.KeepOriginalShader &&
-          this.pushRenderDataWithShader(context, data, materialSubShader.passes, renderStates);
       } else {
-        this.pushRenderDataWithShader(context, data, replacementSubShaders[0].passes, renderStates);
+        this.pushRenderElementByType(renderElement, subRenderElement, materialSubShader.passes, renderStates);
       }
-    } else {
-      this.pushRenderDataWithShader(context, data, materialSubShader.passes, renderStates);
     }
   }
 
-  private pushRenderDataWithShader(
-    context: RenderContext,
-    element: RenderData,
+  private pushRenderElementByType(
+    renderElement: RenderElement,
+    subRenderElement: SubRenderElement,
     shaderPasses: ReadonlyArray<ShaderPass>,
     renderStates: ReadonlyArray<RenderState>
-  ) {
-    const { opaqueQueue, alphaTestQueue, transparentQueue } = this._cullingResults;
-    const renderElementPool = context.camera.engine._renderElementPool;
-
-    let renderQueueAddedFlags = RenderQueueAddedFlag.None;
+  ): void {
+    const cullingResults = this._cullingResults;
     for (let i = 0, n = shaderPasses.length; i < n; i++) {
-      const renderQueueType = (shaderPasses[i]._renderState ?? renderStates[i]).renderQueueType;
-      if (renderQueueAddedFlags & (<RenderQueueAddedFlag>(1 << renderQueueType))) {
+      // Get render queue type
+      let renderQueueType: RenderQueueType;
+      const shaderPass = shaderPasses[i];
+      const renderState = shaderPass._renderState;
+      if (renderState) {
+        renderQueueType = renderState._getRenderQueueByShaderData(
+          shaderPass._renderStateDataMap,
+          subRenderElement.material.shaderData
+        );
+      } else {
+        renderQueueType = renderStates[i].renderQueueType;
+      }
+
+      const flag = 1 << renderQueueType;
+
+      subRenderElement.shaderPasses = shaderPasses;
+      subRenderElement.renderQueueFlags |= flag;
+
+      if (renderElement.renderQueueFlags & flag) {
         continue;
       }
 
-      const renderElement = renderElementPool.getFromPool();
-      renderElement.set(element, shaderPasses);
       switch (renderQueueType) {
         case RenderQueueType.Opaque:
-          opaqueQueue.pushRenderElement(renderElement);
-          renderQueueAddedFlags |= RenderQueueAddedFlag.Opaque;
+          cullingResults.opaqueQueue.pushRenderElement(renderElement);
           break;
         case RenderQueueType.AlphaTest:
-          alphaTestQueue.pushRenderElement(renderElement);
-          renderQueueAddedFlags |= RenderQueueAddedFlag.AlphaTest;
+          cullingResults.alphaTestQueue.pushRenderElement(renderElement);
           break;
         case RenderQueueType.Transparent:
-          transparentQueue.pushRenderElement(renderElement);
-          renderQueueAddedFlags |= RenderQueueAddedFlag.Transparent;
+          cullingResults.transparentQueue.pushRenderElement(renderElement);
           break;
       }
+      renderElement.renderQueueFlags |= flag;
     }
   }
 
-  private _drawBackgroundTexture(engine: Engine, background: Background) {
+  private _drawBackgroundTexture(camera: Camera, background: Background) {
+    const engine = camera.engine;
     const rhi = engine._hardwareRenderer;
     const { canvas } = engine;
     const { _material: material, _mesh: mesh } = background;
@@ -282,52 +413,61 @@ export class BasicRenderPipeline {
     const program = pass._getShaderProgram(engine, Shader._compileMacros);
     program.bind();
     program.uploadAll(program.materialUniformBlock, material.shaderData);
+    program.uploadAll(program.cameraUniformBlock, camera.shaderData);
     program.uploadUnGroupTextures();
 
-    (pass._renderState || material.renderState)._apply(engine, false, pass._renderStateDataMap, material.shaderData);
+    (pass._renderState || material.renderState)._applyStates(
+      engine,
+      false,
+      pass._renderStateDataMap,
+      material.shaderData
+    );
     rhi.drawPrimitive(mesh._primitive, mesh.subMesh, program);
   }
 
   private _prepareRender(context: RenderContext): void {
     const camera = context.camera;
-    const engine = camera.engine;
-    const renderers = camera.scene._componentsManager._renderers;
+    const { engine, enableFrustumCulling, cullingMask, _frustum: frustum } = camera;
+    const { _renderers: renderers, _canvases: canvases } = camera.scene._componentsManager;
 
-    const elements = renderers._elements;
+    const rendererElements = renderers._elements;
     for (let i = renderers.length - 1; i >= 0; --i) {
-      const renderer = elements[i];
-
+      const renderer = rendererElements[i];
       // Filter by camera culling mask
-      if (!(camera.cullingMask & renderer._entity.layer)) {
+      if (!(cullingMask & renderer._entity.layer)) {
         continue;
       }
 
       // Filter by camera frustum
-      if (camera.enableFrustumCulling) {
-        if (!camera._frustum.intersectsBox(renderer.bounds)) {
+      if (enableFrustumCulling) {
+        if (!frustum.intersectsBox(renderer.bounds)) {
           continue;
         }
       }
-      renderer._renderFrameCount = engine.time.frameCount;
       renderer._prepareRender(context);
+      renderer._renderFrameCount = engine.time.frameCount;
     }
-  }
 
-  private _updateMVPShaderData(context: RenderContext) {
-    const camera = context.camera;
-    const renderers = camera.scene._componentsManager._renderers;
-
-    const elements = renderers._elements;
-    for (let i = renderers.length - 1; i >= 0; --i) {
-      const renderer = elements[i];
-      renderer._updateShaderData(context, true);
+    const canvasesElements = canvases._elements;
+    for (let i = canvases.length - 1; i >= 0; i--) {
+      const canvas = canvasesElements[i];
+      // Filter by camera culling mask
+      if (!(cullingMask & canvas.entity.layer)) {
+        continue;
+      }
+      if (!canvas._canRender(camera)) {
+        continue;
+      }
+      canvas._prepareRender(context);
+      this.pushRenderElement(context, canvas._renderElement);
     }
   }
 }
 
-enum RenderQueueAddedFlag {
+export enum RenderQueueFlags {
   None = 0x0,
   Opaque = 0x1,
   AlphaTest = 0x2,
-  Transparent = 0x4
+  Transparent = 0x4,
+  All = 0x7
 }

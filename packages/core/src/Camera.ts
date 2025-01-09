@@ -7,10 +7,12 @@ import { Layer } from "./Layer";
 import { BasicRenderPipeline } from "./RenderPipeline/BasicRenderPipeline";
 import { PipelineUtils } from "./RenderPipeline/PipelineUtils";
 import { Transform } from "./Transform";
+import { UpdateFlagManager } from "./UpdateFlagManager";
 import { VirtualCamera } from "./VirtualCamera";
-import { Logger } from "./base";
+import { GLCapabilityType, Logger } from "./base";
 import { deepClone, ignoreClone } from "./clone/CloneManager";
 import { CameraClearFlags } from "./enums/CameraClearFlags";
+import { CameraModifyFlags } from "./enums/CameraModifyFlags";
 import { CameraType } from "./enums/CameraType";
 import { DepthTextureMode } from "./enums/DepthTextureMode";
 import { Downsampling } from "./enums/Downsampling";
@@ -22,6 +24,7 @@ import { ShaderMacroCollection } from "./shader/ShaderMacroCollection";
 import { ShaderProperty } from "./shader/ShaderProperty";
 import { ShaderTagKey } from "./shader/ShaderTagKey";
 import { ShaderDataGroup } from "./shader/enums/ShaderDataGroup";
+import { TextureFormat } from "./texture";
 import { RenderTarget } from "./texture/RenderTarget";
 import { TextureCubeFace } from "./texture/enums/TextureCubeFace";
 
@@ -65,6 +68,11 @@ export class Camera extends Component {
   cullingMask: Layer = Layer.Everything;
 
   /**
+   * Determines which PostProcess to use.
+   */
+  postProcessMask: Layer = Layer.Everything;
+
+  /**
    * Depth texture mode.
    * If `DepthTextureMode.PrePass` is used, the depth texture can be accessed in the shader using `camera_DepthTexture`.
    *
@@ -82,7 +90,7 @@ export class Camera extends Component {
   /**
    * Multi-sample anti-aliasing samples when use independent canvas mode.
    *
-   * @remarks The `independentCanvasEnabled` property should be `true` to take effect, otherwise it will be invalid.
+   * @remarks It will take effect when `independentCanvasEnabled` property is `true`, otherwise it will be invalid.
    */
   msaaSamples: MSAASamples = MSAASamples.None;
 
@@ -121,11 +129,13 @@ export class Camera extends Component {
   private _renderTarget: RenderTarget = null;
   private _depthBufferParams: Vector4 = new Vector4();
   private _opaqueTextureEnabled: boolean = false;
+  private _enableHDR = false;
+  private _enablePostProcess = false;
 
   @ignoreClone
-  private _frustumChangeFlag: BoolUpdateFlag;
+  private _updateFlagManager: UpdateFlagManager;
   @ignoreClone
-  private _transform: Transform;
+  private _frustumChangeFlag: BoolUpdateFlag;
   @ignoreClone
   private _isViewMatrixDirty: BoolUpdateFlag;
   @ignoreClone
@@ -144,7 +154,6 @@ export class Camera extends Component {
    * If enabled, the opaque texture can be accessed in the shader using `camera_OpaqueTexture`.
    *
    * @defaultValue `false`
-   *
    * @remarks If enabled, the `independentCanvasEnabled` property will be forced to be true.
    */
   get opaqueTextureEnabled(): boolean {
@@ -160,15 +169,19 @@ export class Camera extends Component {
 
   /**
    * Whether independent canvas is enabled.
-   *
    * @remarks If true, the msaa in viewport can turn or off independently by `msaaSamples` property.
    */
   get independentCanvasEnabled(): boolean {
-    if (this._renderTarget) {
-      return false;
+    // Uber pass need internal RT
+    if (this.enablePostProcess && this.scene.postProcessManager._isValid()) {
+      return true;
     }
 
-    return this._forceUseInternalCanvas();
+    if (this.enableHDR || this.opaqueTextureEnabled) {
+      return this._getInternalColorTextureFormat() !== this.renderTarget?.getColorTexture(0).format;
+    }
+
+    return false;
   }
 
   /**
@@ -210,8 +223,11 @@ export class Camera extends Component {
   }
 
   set fieldOfView(value: number) {
-    this._fieldOfView = value;
-    this._projectionMatrixChange();
+    if (this._fieldOfView !== value) {
+      this._fieldOfView = value;
+      this._projectionMatrixChange();
+      this._dispatchModify(CameraModifyFlags.FieldOfView);
+    }
   }
 
   /**
@@ -226,6 +242,7 @@ export class Camera extends Component {
   set aspectRatio(value: number) {
     this._customAspectRatio = value;
     this._projectionMatrixChange();
+    this._dispatchModify(CameraModifyFlags.AspectRatio);
   }
 
   /**
@@ -275,13 +292,16 @@ export class Camera extends Component {
   }
 
   set isOrthographic(value: boolean) {
-    this._virtualCamera.isOrthographic = value;
-    this._projectionMatrixChange();
-
-    if (value) {
-      this.shaderData.enableMacro("CAMERA_ORTHOGRAPHIC");
-    } else {
-      this.shaderData.disableMacro("CAMERA_ORTHOGRAPHIC");
+    const { _virtualCamera: virtualCamera } = this;
+    if (virtualCamera.isOrthographic !== value) {
+      virtualCamera.isOrthographic = value;
+      this._projectionMatrixChange();
+      if (value) {
+        this.shaderData.enableMacro("CAMERA_ORTHOGRAPHIC");
+      } else {
+        this.shaderData.disableMacro("CAMERA_ORTHOGRAPHIC");
+      }
+      this._dispatchModify(CameraModifyFlags.ProjectionType);
     }
   }
 
@@ -293,8 +313,11 @@ export class Camera extends Component {
   }
 
   set orthographicSize(value: number) {
-    this._orthographicSize = value;
-    this._projectionMatrixChange();
+    if (this._orthographicSize !== value) {
+      this._orthographicSize = value;
+      this._projectionMatrixChange();
+      this._dispatchModify(CameraModifyFlags.OrthographicSize);
+    }
   }
 
   /**
@@ -309,7 +332,7 @@ export class Camera extends Component {
     this._isViewMatrixDirty.flag = false;
 
     // Ignore scale
-    const transform = this._transform;
+    const transform = this._entity.transform;
     Matrix.rotationTranslation(transform.worldRotationQuaternion, transform.worldPosition, viewMatrix);
     viewMatrix.invert();
     return viewMatrix;
@@ -359,15 +382,40 @@ export class Camera extends Component {
 
   /**
    * Whether to enable HDR.
-   * @todo When render pipeline modification
+   * @defaultValue `false`
+   * @remarks If enabled, the `independentCanvasEnabled` property will be forced to be true.
    */
   get enableHDR(): boolean {
-    console.log("not implementation");
-    return false;
+    return this._enableHDR;
   }
 
   set enableHDR(value: boolean) {
-    console.log("not implementation");
+    if (this.enableHDR !== value) {
+      const rhi = this.engine._hardwareRenderer;
+      const supportHDR = rhi.isWebGL2 || rhi.canIUse(GLCapabilityType.textureHalfFloat);
+      if (value && !supportHDR) {
+        Logger.warn("Can't enable HDR in this device.");
+        return;
+      }
+      this._enableHDR = value;
+      this._checkMainCanvasAntialiasWaste();
+    }
+  }
+
+  /**
+   * Whether to enable post process.
+   * @defaultValue `false`
+   * @remarks If enabled, the `independentCanvasEnabled` property will be forced to be true.
+   */
+  get enablePostProcess(): boolean {
+    return this._enablePostProcess;
+  }
+
+  set enablePostProcess(value: boolean) {
+    if (this._enablePostProcess !== value) {
+      this._enablePostProcess = value;
+      this._checkMainCanvasAntialiasWaste();
+    }
   }
 
   /**
@@ -383,7 +431,6 @@ export class Camera extends Component {
       value && this._addResourceReferCount(value, 1);
       this._renderTarget = value;
       this._onPixelViewportChanged();
-      this._checkMainCanvasAntialiasWaste();
     }
   }
 
@@ -393,11 +440,9 @@ export class Camera extends Component {
   constructor(entity: Entity) {
     super(entity);
 
-    const transform = this.entity.transform;
-    this._transform = transform;
-    this._isViewMatrixDirty = transform.registerWorldChangeFlag();
-    this._isInvViewProjDirty = transform.registerWorldChangeFlag();
-    this._frustumChangeFlag = transform.registerWorldChangeFlag();
+    this._isViewMatrixDirty = entity.registerWorldChangeFlag();
+    this._isInvViewProjDirty = entity.registerWorldChangeFlag();
+    this._frustumChangeFlag = entity.registerWorldChangeFlag();
     this._renderPipeline = new BasicRenderPipeline(this);
     this._addResourceReferCount(this.shaderData, 1);
     this._updatePixelViewport();
@@ -430,6 +475,7 @@ export class Camera extends Component {
   resetAspectRatio(): void {
     this._customAspectRatio = undefined;
     this._projectionMatrixChange();
+    this._dispatchModify(CameraModifyFlags.AspectRatio);
   }
 
   /**
@@ -573,10 +619,11 @@ export class Camera extends Component {
    * @param mipLevel - Set mip level the data want to write, only take effect in webgl2.0
    */
   render(cubeFace?: TextureCubeFace, mipLevel: number = 0): void {
-    const context = this.engine._renderContext;
+    const engine = this._engine;
+    const context = engine._renderContext;
     const virtualCamera = this._virtualCamera;
 
-    const transform = this.entity.transform;
+    const transform = this._entity.transform;
     Matrix.multiply(this.projectionMatrix, this.viewMatrix, virtualCamera.viewProjectionMatrix);
     virtualCamera.position.copyFrom(transform.worldPosition);
     if (virtualCamera.isOrthographic) {
@@ -604,16 +651,16 @@ export class Camera extends Component {
       this._globalShaderMacro
     );
 
-    if (mipLevel > 0 && !this.engine._hardwareRenderer.isWebGL2) {
+    if (mipLevel > 0 && !engine._hardwareRenderer.isWebGL2) {
       mipLevel = 0;
       Logger.error("mipLevel only take effect in WebGL2.0");
     }
-    let clearMask: CameraClearFlags;
-    if (this._cameraType !== CameraType.Normal) {
-      clearMask = this.engine.xrManager._getCameraClearFlagsMask(this._cameraType);
+    let ignoreClearFlags: CameraClearFlags;
+    if (this._cameraType !== CameraType.Normal && !this._renderTarget && !this.independentCanvasEnabled) {
+      ignoreClearFlags = engine.xrManager._getCameraIgnoreClearFlags(this._cameraType);
     }
-    this._renderPipeline.render(context, cubeFace, mipLevel, clearMask);
-    this._engine._renderCount++;
+    this._renderPipeline.render(context, cubeFace, mipLevel, ignoreClearFlags);
+    engine._renderCount++;
   }
 
   /**
@@ -665,6 +712,7 @@ export class Camera extends Component {
    */
   override _onEnableInScene(): void {
     this.scene._componentsManager.addCamera(this);
+    this._dispatchModify(CameraModifyFlags.EnableInScene);
   }
 
   /**
@@ -672,6 +720,32 @@ export class Camera extends Component {
    */
   override _onDisableInScene(): void {
     this.scene._componentsManager.removeCamera(this);
+    this._dispatchModify(CameraModifyFlags.DisableInScene);
+  }
+
+  /**
+   * @internal
+   */
+  _getInternalColorTextureFormat(): TextureFormat {
+    return this._enableHDR
+      ? this.engine._hardwareRenderer.isWebGL2
+        ? TextureFormat.R11G11B10_UFloat
+        : TextureFormat.R16G16B16A16
+      : TextureFormat.R8G8B8A8;
+  }
+
+  /**
+   * @internal
+   */
+  _registerModifyListener(onChange: (flag: CameraModifyFlags) => void): void {
+    (this._updateFlagManager ||= new UpdateFlagManager()).addListener(onChange);
+  }
+
+  /**
+   * @internal
+   */
+  _unRegisterModifyListener(onChange: (flag: CameraModifyFlags) => void): void {
+    this._updateFlagManager?.removeListener(onChange);
   }
 
   /**
@@ -688,6 +762,7 @@ export class Camera extends Component {
     //@ts-ignore
     this._viewport._onValueChanged = null;
     this.engine.canvas._sizeUpdateFlagManager.removeListener(this._onPixelViewportChanged);
+    this._updateFlagManager = null;
 
     this._entity = null;
     this._globalShaderMacro = null;
@@ -696,7 +771,6 @@ export class Camera extends Component {
     this._virtualCamera = null;
     this._shaderData = null;
     this._frustumChangeFlag = null;
-    this._transform = null;
     this._isViewMatrixDirty = null;
     this._isInvViewProjDirty = null;
     this._viewport = null;
@@ -719,6 +793,7 @@ export class Camera extends Component {
 
     const viewport = this._viewport;
     this._pixelViewport.set(viewport.x * width, viewport.y * height, viewport.z * width, viewport.w * height);
+    !this._customAspectRatio && this._dispatchModify(CameraModifyFlags.AspectRatio);
   }
 
   private _viewMatrixChange(): void {
@@ -746,7 +821,7 @@ export class Camera extends Component {
   private _updateShaderData(): void {
     const shaderData = this.shaderData;
 
-    const transform = this._transform;
+    const transform = this._entity.transform;
     shaderData.setMatrix(Camera._inverseViewMatrixProperty, transform.worldMatrix);
     shaderData.setVector3(Camera._cameraPositionProperty, transform.worldPosition);
     shaderData.setVector3(Camera._cameraForwardProperty, transform.worldForward);
@@ -764,7 +839,7 @@ export class Camera extends Component {
   private _getInvViewProjMat(): Matrix {
     if (this._isInvViewProjDirty.flag) {
       this._isInvViewProjDirty.flag = false;
-      Matrix.multiply(this._transform.worldMatrix, this._getInverseProjectionMatrix(), this._invViewProjMat);
+      Matrix.multiply(this._entity.transform.worldMatrix, this._getInverseProjectionMatrix(), this._invViewProjMat);
     }
     return this._invViewProjMat;
   }
@@ -780,10 +855,6 @@ export class Camera extends Component {
     return this._inverseProjectionMatrix;
   }
 
-  private _forceUseInternalCanvas(): boolean {
-    return this.opaqueTextureEnabled;
-  }
-
   @ignoreClone
   private _onPixelViewportChanged(): void {
     this._updatePixelViewport();
@@ -792,10 +863,18 @@ export class Camera extends Component {
   }
 
   private _checkMainCanvasAntialiasWaste(): void {
-    if (this.independentCanvasEnabled && Vector4.equals(this._viewport, PipelineUtils.defaultViewport)) {
-      console.warn(
+    if (
+      this._phasedActiveInScene &&
+      this.independentCanvasEnabled &&
+      Vector4.equals(this._viewport, PipelineUtils.defaultViewport)
+    ) {
+      Logger.warn(
         "Camera use independent canvas and viewport cover the whole screen, it is recommended to disable antialias, depth and stencil to save memory when create engine."
       );
     }
+  }
+
+  private _dispatchModify(flag: CameraModifyFlags): void {
+    this._updateFlagManager?.dispatch(flag);
   }
 }

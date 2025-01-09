@@ -1,10 +1,9 @@
 import { Vector2 } from "@galacean/engine-math";
-import { Engine } from "../../Engine";
 import { FontStyle } from "../enums/FontStyle";
 import { OverflowMode } from "../enums/TextOverflow";
 import { CharInfo } from "./CharInfo";
+import { ITextRenderer } from "./ITextRenderer";
 import { SubFont } from "./SubFont";
-import { TextRenderer } from "./TextRenderer";
 
 /**
  * @internal
@@ -96,8 +95,13 @@ export class TextUtils {
     return <CharInfo>TextUtils._measureFontOrChar(fontString, char, true);
   }
 
-  static measureTextWithWrap(renderer: TextRenderer): TextMetrics {
-    const subFont = renderer._subFont;
+  static measureTextWithWrap(
+    renderer: ITextRenderer,
+    rendererWidth: number,
+    rendererHeight: number,
+    lineSpacing: number
+  ): TextMetrics {
+    const subFont = renderer._getSubFont();
     const fontString = subFont.nativeFontString;
     const fontSizeInfo = TextUtils.measureFont(fontString);
     const subTexts = renderer.text.split(/(?:\r\n|\r|\n)/);
@@ -106,9 +110,7 @@ export class TextUtils {
     const lineWidths = new Array<number>();
     const lineMaxSizes = new Array<FontSizeInfo>();
 
-    const pixelsPerUnit = Engine._pixelsPerUnit;
-    const lineHeight = fontSizeInfo.size + renderer.lineSpacing * pixelsPerUnit;
-    const wrapWidth = renderer.width * pixelsPerUnit;
+    const lineHeight = fontSizeInfo.size + lineSpacing;
     let textWidth = 0;
 
     subFont.nativeFontString = fontString;
@@ -152,7 +154,7 @@ export class TextUtils {
         if (unableFromWord) {
           // If it is a word before, need to handle the previous word and line
           if (word.length > 0) {
-            if (lineWidth + wordWidth > wrapWidth) {
+            if (lineWidth + wordWidth > rendererWidth) {
               // Push if before line is not empty
               if (lineWidth > 0) {
                 this._pushLine(lines, lineWidths, lineMaxSizes, line, lineWidth, lineMaxAscent, lineMaxDescent);
@@ -177,7 +179,7 @@ export class TextUtils {
 
           // Handle char
           // At least one char in a line
-          if (lineWidth + w > wrapWidth && lineWidth > 0) {
+          if (lineWidth + w > rendererWidth && lineWidth > 0) {
             this._pushLine(lines, lineWidths, lineMaxSizes, line, lineWidth, lineMaxAscent, lineMaxDescent);
             textWidth = Math.max(textWidth, lineWidth);
             notFirstLine = true;
@@ -197,7 +199,7 @@ export class TextUtils {
             lineMaxDescent = Math.max(lineMaxDescent, descent);
           }
         } else {
-          if (wordWidth + charInfo.w > wrapWidth) {
+          if (wordWidth + charInfo.w > rendererWidth) {
             if (lineWidth > 0) {
               this._pushLine(lines, lineWidths, lineMaxSizes, line, lineWidth, lineMaxAscent, lineMaxDescent);
               textWidth = Math.max(textWidth, lineWidth);
@@ -227,7 +229,7 @@ export class TextUtils {
 
       if (wordWidth > 0) {
         // If the total width from line and word exceed wrap width
-        if (lineWidth + wordWidth > wrapWidth) {
+        if (lineWidth + wordWidth > rendererWidth) {
           // Push chars to a single line
           if (lineWidth > 0) {
             this._pushLine(lines, lineWidths, lineMaxSizes, line, lineWidth, lineMaxAscent, lineMaxDescent);
@@ -255,7 +257,7 @@ export class TextUtils {
       }
     }
 
-    let height = renderer.height * pixelsPerUnit;
+    let height = rendererHeight;
     if (renderer.overflowMode === OverflowMode.Overflow) {
       height = lineHeight * lines.length;
     }
@@ -270,8 +272,8 @@ export class TextUtils {
     };
   }
 
-  static measureTextWithoutWrap(renderer: TextRenderer): TextMetrics {
-    const { _subFont: subFont } = renderer;
+  static measureTextWithoutWrap(renderer: ITextRenderer, rendererHeight: number, lineSpacing: number): TextMetrics {
+    const subFont = renderer._getSubFont();
     const fontString = subFont.nativeFontString;
     const fontSizeInfo = TextUtils.measureFont(fontString);
     const subTexts = renderer.text.split(/(?:\r\n|\r|\n)/);
@@ -279,8 +281,7 @@ export class TextUtils {
     const lines = new Array<string>();
     const lineWidths = new Array<number>();
     const lineMaxSizes = new Array<FontSizeInfo>();
-    const { _pixelsPerUnit } = Engine;
-    const lineHeight = fontSizeInfo.size + renderer.lineSpacing * _pixelsPerUnit;
+    const lineHeight = fontSizeInfo.size + lineSpacing;
 
     let width = 0;
     subFont.nativeFontString = fontString;
@@ -307,7 +308,7 @@ export class TextUtils {
       }
     }
 
-    let height = renderer.height * _pixelsPerUnit;
+    let height = rendererHeight;
     if (renderer.overflowMode === OverflowMode.Overflow) {
       height = lineHeight * lines.length;
     }
@@ -342,7 +343,6 @@ export class TextUtils {
 
   /**
    * @internal
-   * Use internal for CanvasRenderer plugin.
    */
   static _measureFontOrChar(fontString: string, measureString: string, isChar: boolean): FontSizeInfo | CharInfo {
     const { canvas, context } = TextUtils.textContext();
@@ -350,12 +350,15 @@ export class TextUtils {
     // Safari gets data confusion through getImageData when the canvas width is not an integer.
     // The measure text width of some special invisible characters may be 0, so make sure the width is at least 1.
     // @todo: Text layout may vary from standard and not support emoji.
-    const textMetrics = context.measureText(measureString);
+    const { actualBoundingBoxLeft, actualBoundingBoxRight, width: actualWidth } = context.measureText(measureString);
     // In some case (ex: " "), actualBoundingBoxRight and actualBoundingBoxLeft will be 0, so use width.
+    // TODO: With testing, actualBoundingBoxLeft + actualBoundingBoxRight is the actual rendering width
+    // but the space rules between characters are unclear. Using actualBoundingBoxRight + Math.abs(actualBoundingBoxLeft) is the closest to the native effect.
     const width = Math.max(
       1,
-      Math.round(textMetrics.actualBoundingBoxRight - textMetrics.actualBoundingBoxLeft || textMetrics.width)
+      Math.round(Math.max(actualBoundingBoxRight + Math.abs(actualBoundingBoxLeft), actualWidth))
     );
+    // Make sure enough width.
     let baseline = Math.ceil(context.measureText(TextUtils._measureBaseline).width);
     let height = baseline * TextUtils._heightMultiplier;
     baseline = (TextUtils._baselineMultiplier * baseline) | 0;
@@ -371,7 +374,11 @@ export class TextUtils {
     context.clearRect(0, 0, width, height);
     context.textBaseline = "middle";
     context.fillStyle = "#fff";
-    context.fillText(measureString, 0, baseline);
+    if (actualBoundingBoxLeft > 0) {
+      context.fillText(measureString, actualBoundingBoxLeft, baseline);
+    } else {
+      context.fillText(measureString, 0, baseline);
+    }
 
     const colorData = context.getImageData(0, 0, width, height).data;
     const len = colorData.length;
@@ -422,9 +429,9 @@ export class TextUtils {
         y: 0,
         w: width,
         h: size,
-        offsetX: 0,
+        offsetX: actualBoundingBoxLeft > 0 ? actualBoundingBoxLeft : 0,
         offsetY: (ascent - descent) * 0.5,
-        xAdvance: width,
+        xAdvance: Math.round(actualWidth),
         uvs: [new Vector2(), new Vector2(), new Vector2(), new Vector2()],
         ascent,
         descent,
@@ -438,7 +445,6 @@ export class TextUtils {
 
   /**
    * @internal
-   * Use internal for CanvasRenderer plugin.
    */
   static _getCharInfo(char: string, fontString: string, font: SubFont): CharInfo {
     let charInfo = font._getCharInfo(char);

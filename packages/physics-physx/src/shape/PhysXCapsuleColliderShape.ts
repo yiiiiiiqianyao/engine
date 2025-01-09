@@ -13,7 +13,6 @@ export class PhysXCapsuleColliderShape extends PhysXColliderShape implements ICa
   /** @internal */
   _halfHeight: number;
   private _upAxis: ColliderShapeUpAxis = ColliderShapeUpAxis.Y;
-  private _sizeScale: Vector3 = new Vector3(1, 1, 1);
 
   constructor(
     physXPhysics: PhysXPhysics,
@@ -39,7 +38,7 @@ export class PhysXCapsuleColliderShape extends PhysXColliderShape implements ICa
    */
   setRadius(value: number): void {
     this._radius = value;
-    const sizeScale = this._sizeScale;
+    const sizeScale = this._worldScale;
     switch (this._upAxis) {
       case ColliderShapeUpAxis.X:
         this._pxGeometry.radius = this._radius * Math.max(sizeScale.y, sizeScale.z);
@@ -56,7 +55,7 @@ export class PhysXCapsuleColliderShape extends PhysXColliderShape implements ICa
     const radius = this._pxGeometry.radius;
     const controllers = this._controllers;
     for (let i = 0, n = controllers.length; i < n; i++) {
-      controllers.get(i)._pxController.setRadius(radius);
+      controllers.get(i)._pxController?.setRadius(radius);
     }
   }
 
@@ -65,7 +64,7 @@ export class PhysXCapsuleColliderShape extends PhysXColliderShape implements ICa
    */
   setHeight(value: number): void {
     this._halfHeight = value * 0.5;
-    const sizeScale = this._sizeScale;
+    const sizeScale = this._worldScale;
     switch (this._upAxis) {
       case ColliderShapeUpAxis.X:
         this._pxGeometry.halfHeight = this._halfHeight * sizeScale.x;
@@ -82,7 +81,7 @@ export class PhysXCapsuleColliderShape extends PhysXColliderShape implements ICa
     const height = this._pxGeometry.halfHeight * 2;
     const controllers = this._controllers;
     for (let i = 0, n = controllers.length; i < n; i++) {
-      controllers.get(i)._pxController.setHeight(height);
+      controllers.get(i)._pxController?.setHeight(height);
     }
   }
 
@@ -105,7 +104,7 @@ export class PhysXCapsuleColliderShape extends PhysXColliderShape implements ICa
         break;
     }
     if (rotation) {
-      Quaternion.rotationYawPitchRoll(rotation.x, rotation.y, rotation.z, physXRotation);
+      Quaternion.rotationYawPitchRoll(rotation.y, rotation.x, rotation.z, physXRotation);
       Quaternion.multiply(physXRotation, axis, physXRotation);
     } else {
       physXRotation.copyFrom(axis);
@@ -118,8 +117,7 @@ export class PhysXCapsuleColliderShape extends PhysXColliderShape implements ICa
    */
   override setWorldScale(scale: Vector3): void {
     super.setWorldScale(scale);
-
-    const sizeScale = this._sizeScale.set(Math.abs(scale.x), Math.abs(scale.y), Math.abs(scale.z));
+    const sizeScale = this._worldScale;
     const geometry = this._pxGeometry;
     switch (this._upAxis) {
       case ColliderShapeUpAxis.X:
@@ -142,8 +140,10 @@ export class PhysXCapsuleColliderShape extends PhysXColliderShape implements ICa
     const controllers = this._controllers;
     for (let i = 0, n = controllers.length; i < n; i++) {
       const pxController = controllers.get(i)._pxController;
-      pxController.setRadius(radius);
-      pxController.setHeight(height);
+      if (pxController) {
+        pxController.setRadius(radius);
+        pxController.setHeight(height);
+      }
     }
   }
 }

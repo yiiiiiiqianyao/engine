@@ -1,20 +1,11 @@
 import { Vector4 } from "@galacean/engine-math";
 import { Engine } from "../Engine";
-import { ShaderProperty } from "../shader";
-import { Shader } from "../shader/Shader";
-import { ShaderData } from "../shader/ShaderData";
-import { ShaderDataGroup } from "../shader/enums/ShaderDataGroup";
-import { RenderTarget, Texture2D, TextureFormat } from "../texture";
+import { RenderTarget, Texture2D, TextureFilterMode, TextureFormat, TextureWrapMode } from "../texture";
 
 /**
  * @internal
  */
 export class PipelineUtils {
-  private static _blitTextureProperty = ShaderProperty.getByName("renderer_BlitTexture");
-  private static _blitMipLevelProperty = ShaderProperty.getByName("renderer_BlitMipLevel");
-
-  private static _rendererShaderData = new ShaderData(ShaderDataGroup.Renderer);
-
   static readonly defaultViewport = new Vector4(0, 0, 1, 1);
 
   /**
@@ -25,6 +16,8 @@ export class PipelineUtils {
    * @param height - Need texture height
    * @param format - Need texture format
    * @param mipmap - Need texture mipmap
+   * @param textureWrapMode - Texture wrap mode
+   * @param textureFilterMode - Texture filter mode
    * @returns Texture
    */
   static recreateTextureIfNeeded(
@@ -33,7 +26,9 @@ export class PipelineUtils {
     width: number,
     height: number,
     format: TextureFormat,
-    mipmap: boolean
+    mipmap: boolean,
+    textureWrapMode: TextureWrapMode,
+    textureFilterMode: TextureFilterMode
   ): Texture2D {
     if (currentTexture) {
       if (
@@ -43,17 +38,18 @@ export class PipelineUtils {
         currentTexture.mipmapCount > 1 !== mipmap
       ) {
         currentTexture.destroy(true);
-        const texture = new Texture2D(engine, width, height, format, mipmap);
-        texture.isGCIgnored = true;
-        return texture;
-      } else {
-        return currentTexture;
+        currentTexture = new Texture2D(engine, width, height, format, mipmap);
+        currentTexture.isGCIgnored = true;
       }
     } else {
-      const texture = new Texture2D(engine, width, height, format, mipmap);
-      texture.isGCIgnored = true;
-      return texture;
+      currentTexture = new Texture2D(engine, width, height, format, mipmap);
+      currentTexture.isGCIgnored = true;
     }
+
+    currentTexture.wrapModeU = currentTexture.wrapModeV = textureWrapMode;
+    currentTexture.filterMode = textureFilterMode;
+
+    return currentTexture;
   }
 
   /**
@@ -66,6 +62,8 @@ export class PipelineUtils {
    * @param depthFormat - Need render target depth format
    * @param mipmap - Need render target mipmap
    * @param antiAliasing - Need render target anti aliasing
+   * @param textureWrapMode - Texture wrap mode
+   * @param textureFilterMode - Texture filter mode
    * @returns Render target
    */
   static recreateRenderTargetIfNeeded(
@@ -77,17 +75,37 @@ export class PipelineUtils {
     depthFormat: TextureFormat | null,
     needDepthTexture: boolean,
     mipmap: boolean,
-    antiAliasing: number
+    antiAliasing: number,
+    textureWrapMode: TextureWrapMode,
+    textureFilterMode: TextureFilterMode
   ): RenderTarget {
     const currentColorTexture = <Texture2D>currentRenderTarget?.getColorTexture(0);
     const colorTexture = colorFormat
-      ? PipelineUtils.recreateTextureIfNeeded(engine, currentColorTexture, width, height, colorFormat, mipmap)
+      ? PipelineUtils.recreateTextureIfNeeded(
+          engine,
+          currentColorTexture,
+          width,
+          height,
+          colorFormat,
+          mipmap,
+          textureWrapMode,
+          textureFilterMode
+        )
       : null;
 
     if (needDepthTexture) {
       const currentDepthTexture = <Texture2D>currentRenderTarget?.depthTexture;
       const needDepthTexture = depthFormat
-        ? PipelineUtils.recreateTextureIfNeeded(engine, currentDepthTexture, width, height, depthFormat, mipmap)
+        ? PipelineUtils.recreateTextureIfNeeded(
+            engine,
+            currentDepthTexture,
+            width,
+            height,
+            depthFormat,
+            mipmap,
+            textureWrapMode,
+            textureFilterMode
+          )
         : null;
 
       if (currentColorTexture !== colorTexture || currentDepthTexture !== needDepthTexture) {
@@ -96,64 +114,17 @@ export class PipelineUtils {
         currentRenderTarget.isGCIgnored = true;
       }
     } else {
-      const needDepthFormat = depthFormat;
-
-      if (currentColorTexture !== colorTexture || currentRenderTarget?._depthFormat !== needDepthFormat) {
+      if (
+        currentColorTexture !== colorTexture ||
+        currentRenderTarget?._depthFormat !== depthFormat ||
+        currentRenderTarget.antiAliasing !== antiAliasing
+      ) {
         currentRenderTarget?.destroy(true);
-        currentRenderTarget = new RenderTarget(engine, width, height, colorTexture, needDepthFormat, antiAliasing);
+        currentRenderTarget = new RenderTarget(engine, width, height, colorTexture, depthFormat, antiAliasing);
         currentRenderTarget.isGCIgnored = true;
       }
     }
 
     return currentRenderTarget;
-  }
-
-  /**
-   * Blit texture to destination render target.
-   * @param engine - Engine
-   * @param source - Source texture
-   * @param destination - Destination render target
-   * @param mipLevel - Mip level to blit
-   * @param viewport - Viewport
-   */
-  static blitTexture(
-    engine: Engine,
-    source: Texture2D,
-    destination: RenderTarget | null,
-    mipLevel: number = 0,
-    viewport?: Vector4
-  ): void {
-    const basicResources = engine._basicResources;
-    const blitMesh = destination ? basicResources.flipYBlitMesh : basicResources.blitMesh;
-    const blitMaterial = basicResources.blitMaterial;
-    const rhi = engine._hardwareRenderer;
-
-    const context = engine._renderContext;
-    // We not use projection matrix when blit, but we must modify flipProjection to make front face correct
-    context.flipProjection = destination ? true : false;
-
-    rhi.activeRenderTarget(destination, viewport ?? PipelineUtils.defaultViewport, context.flipProjection, 0);
-
-    const rendererShaderData = PipelineUtils._rendererShaderData;
-    const pass = blitMaterial.shader.subShaders[0].passes[0];
-    const program = pass._getShaderProgram(engine, Shader._compileMacros);
-
-    rendererShaderData.setTexture(PipelineUtils._blitTextureProperty, source);
-    rendererShaderData.setFloat(PipelineUtils._blitMipLevelProperty, mipLevel);
-
-    program.bind();
-    program.groupingOtherUniformBlock();
-    program.uploadAll(program.rendererUniformBlock, rendererShaderData);
-    program.uploadAll(program.materialUniformBlock, blitMaterial.shaderData);
-    program.uploadUnGroupTextures();
-
-    (pass._renderState || blitMaterial.renderState)._apply(
-      engine,
-      false,
-      pass._renderStateDataMap,
-      blitMaterial.shaderData
-    );
-
-    rhi.drawPrimitive(blitMesh._primitive, blitMesh.subMesh, program);
   }
 }

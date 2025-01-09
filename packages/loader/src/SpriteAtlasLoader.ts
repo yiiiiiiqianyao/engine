@@ -27,7 +27,8 @@ class SpriteAtlasLoader extends Loader<SpriteAtlas> {
           chainPromises[i].cancel();
         }
       });
-      const configPromise = this.request<AtlasConfig>(item.url, {
+      // @ts-ignore
+      const configPromise = resourceManager._request<AtlasConfig>(item.url, {
         ...item,
         type: "json"
       });
@@ -38,12 +39,12 @@ class SpriteAtlasLoader extends Loader<SpriteAtlas> {
           const atlasItemsLen = atlasItems ? atlasItems.length : 0;
           const { engine } = resourceManager;
           const spriteAtlas = new SpriteAtlas(engine);
-          if (atlasItemsLen < 0) {
+          if (atlasItemsLen <= 0) {
             resolve(spriteAtlas);
             return;
           }
           chainPromises.length = 0;
-          for (let i = 0; i < atlasItems.length; i++) {
+          for (let i = 0; i < atlasItemsLen; i++) {
             const atlasItem = atlasItems[i];
             if (atlasItem.img) {
               chainPromises.push(
@@ -103,8 +104,8 @@ class SpriteAtlasLoader extends Loader<SpriteAtlas> {
       }
       config.atlasRotated && (sprite.atlasRotated = true);
     }
-    isNaN(width) || (sprite.width = width);
-    isNaN(height) || (sprite.height = height);
+    width === undefined || (sprite.width = width);
+    height === undefined || (sprite.height = height);
     return sprite;
   }
 }

@@ -3,6 +3,7 @@ import { Background } from "./Background";
 import { ComponentsManager } from "./ComponentsManager";
 import { Engine } from "./Engine";
 import { Entity } from "./Entity";
+import { MaskManager } from "./RenderPipeline/MaskManager";
 import { SceneManager } from "./SceneManager";
 import { EngineObject, Logger } from "./base";
 import { ActiveChangeFlag } from "./enums/ActiveChangeFlag";
@@ -11,6 +12,7 @@ import { DirectLight } from "./lighting";
 import { AmbientLight } from "./lighting/AmbientLight";
 import { LightManager } from "./lighting/LightManager";
 import { PhysicsScene } from "./physics/PhysicsScene";
+import { PostProcessManager } from "./postProcess";
 import { ShaderProperty } from "./shader";
 import { ShaderData } from "./shader/ShaderData";
 import { ShaderMacroCollection } from "./shader/ShaderMacroCollection";
@@ -25,6 +27,7 @@ import { ShadowType } from "./shadow/enum/ShadowType";
 export class Scene extends EngineObject {
   private static _fogColorProperty = ShaderProperty.getByName("scene_FogColor");
   private static _fogParamsProperty = ShaderProperty.getByName("scene_FogParams");
+  private static _prefilterdDFGProperty = ShaderProperty.getByName("scene_PrefilteredDFG");
 
   /** Scene name. */
   name: string;
@@ -48,10 +51,15 @@ export class Scene extends EngineObject {
    */
   shadowFadeBorder: number = 0.1;
 
+  /** Post process manager. */
+  readonly postProcessManager = new PostProcessManager(this);
+
   /* @internal */
   _lightManager: LightManager = new LightManager();
   /* @internal */
   _componentsManager: ComponentsManager = new ComponentsManager();
+  /** @internal */
+  _maskManager: MaskManager = new MaskManager();
   /** @internal */
   _isActiveInEngine: boolean = false;
   /** @internal */
@@ -73,6 +81,7 @@ export class Scene extends EngineObject {
   private _fogParams: Vector4 = new Vector4();
   private _isActive: boolean = true;
   private _sun: DirectLight | null;
+  private _enableTransparentShadow = false;
 
   /**
    * Whether the scene is active.
@@ -242,6 +251,24 @@ export class Scene extends EngineObject {
   }
 
   /**
+   * Whether to enable transparent shadow.
+   */
+  get enableTransparentShadow(): boolean {
+    return this._enableTransparentShadow;
+  }
+
+  set enableTransparentShadow(value: boolean) {
+    if (value !== this._enableTransparentShadow) {
+      this._enableTransparentShadow = value;
+      if (value) {
+        this.shaderData.enableMacro("SCENE_ENABLE_TRANSPARENT_SHADOW");
+      } else {
+        this.shaderData.disableMacro("SCENE_ENABLE_TRANSPARENT_SHADOW");
+      }
+    }
+  }
+
+  /**
    * Create scene.
    * @param engine - Engine
    * @param name - Name
@@ -259,6 +286,7 @@ export class Scene extends EngineObject {
     shaderData.enableMacro("SCENE_SHADOW_CASCADED_COUNT", this.shadowCascades.toString());
     shaderData.setColor(Scene._fogColorProperty, this._fogColor);
     shaderData.setVector4(Scene._fogParamsProperty, this._fogParams);
+    shaderData.setTexture(Scene._prefilterdDFGProperty, engine._basicResources.prefilteredDFGTexture);
 
     this._computeLinearFogParams(this._fogStart, this._fogEnd);
     this._computeExponentialFogParams(this._fogDensity);
@@ -302,6 +330,7 @@ export class Scene extends EngineObject {
     if (!isRoot) {
       entity._isRoot = true;
       entity._removeFromParent();
+      entity._setParentChange();
     }
 
     // Add or remove from scene's rootEntities
@@ -485,6 +514,7 @@ export class Scene extends EngineObject {
     this._ambientLight && this._ambientLight._removeFromScene(this);
     this.shaderData._addReferCount(-1);
     this._componentsManager.handlingInvalidScripts();
+    this._maskManager.destroy();
 
     const allCreatedScenes = sceneManager._allCreatedScenes;
     allCreatedScenes.splice(allCreatedScenes.indexOf(this), 1);

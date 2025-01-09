@@ -1,12 +1,19 @@
 import { testCaseList } from "./test-case";
-import { Preprocessor } from "@galacean/engine-shader-lab";
-import { expect } from "chai";
+// @ts-ignore
+import { ShaderLib } from "@galacean/engine-core";
+import { Preprocessor } from "@galacean/engine-shaderlab/verbose";
+import { describe, expect, it } from "vitest";
+import { server } from "@vitest/browser/context";
+const { readFile } = server.commands;
+
+const includedSource = await readFile("test-case/included.txt");
+ShaderLib["TEST"] = includedSource;
 
 describe("Preprocessor", () => {
   for (const testCase of testCaseList) {
     it(testCase.name, () => {
-      const preprocessor = new Preprocessor(testCase.source);
-      const out = preprocessor.process();
+      Preprocessor.reset({});
+      const out = Preprocessor.process(testCase.source);
       expect(out).to.equal(testCase.compare);
     });
   }

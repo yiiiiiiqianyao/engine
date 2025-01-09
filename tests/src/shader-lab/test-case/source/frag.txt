@@ -1,10 +1,17 @@
+void Gerstner() {
+    // #ifdef CALCULATE_NORMALS
+    nrml += GerstnerNormal4( position, amplitude, frequency, speed, directionAB, directionCD, normalStr );
+    // #endif
+  }
+
 #if defined(SCENE_SHADOW_TYPE ) && defined( RENDERER_IS_RECEIVE_SHADOWS )
 #define SCENE_IS_CALCULATE_SHADOWS
 #endif
 
 // #include "ShadowCoord"
 
-#define TT 1.0 // comments
+#define TT 1./** comments 
+*/0 // test
 #define QQ
 
 vec4 a = vec4(TT,1.0,3.0,4.0);

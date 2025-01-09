@@ -1,6 +1,7 @@
 import { UpdateFlagManager } from "../UpdateFlagManager";
 import { AnimationClip } from "./AnimationClip";
-import { AnimatorStateTransition } from "./AnimatorTransition";
+import { AnimatorStateTransition } from "./AnimatorStateTransition";
+import { AnimatorStateTransitionCollection } from "./AnimatorStateTransitionCollection";
 import { WrapMode } from "./enums/WrapMode";
 import { StateMachineScript } from "./StateMachineScript";
 
@@ -21,17 +22,18 @@ export class AnimatorState {
   _onStateExitScripts: StateMachineScript[] = [];
   /** @internal */
   _updateFlagManager: UpdateFlagManager = new UpdateFlagManager();
+  /** @internal */
+  _transitionCollection: AnimatorStateTransitionCollection = new AnimatorStateTransitionCollection();
 
   private _clipStartTime: number = 0;
   private _clipEndTime: number = 1;
   private _clip: AnimationClip;
-  private _transitions: AnimatorStateTransition[] = [];
 
   /**
    * The transitions that are going out of the state.
    */
   get transitions(): Readonly<AnimatorStateTransition[]> {
-    return this._transitions;
+    return this._transitionCollection.transitions;
   }
 
   /**
@@ -60,9 +62,9 @@ export class AnimatorState {
   }
 
   /**
-   * The start time of the clip, the range is 0 to 1, default is 0.
+   * The normalized start time of the clip, the range is 0 to 1, default is 0.
    */
-  get clipStartTime() {
+  get clipStartTime(): number {
     return this._clipStartTime;
   }
 
@@ -71,9 +73,9 @@ export class AnimatorState {
   }
 
   /**
-   * The end time of the clip, the range is 0 to 1, default is 1.
+   * The normalized end time of the clip, the range is 0 to 1, default is 1.
    */
-  get clipEndTime() {
+  get clipEndTime(): number {
     return this._clipEndTime;
   }
 
@@ -89,30 +91,40 @@ export class AnimatorState {
   }
 
   /**
-   * Add an outgoing transition to the destination state.
+   * Add an outgoing transition.
    * @param transition - The transition
    */
-  addTransition(transition: AnimatorStateTransition): void {
-    const transitions = this._transitions;
-    const count = transitions.length;
-    const time = transition.exitTime;
-    const maxExitTime = count ? transitions[count - 1].exitTime : 0;
-    if (time >= maxExitTime) {
-      transitions.push(transition);
-    } else {
-      let index = count;
-      while (--index >= 0 && time < transitions[index].exitTime);
-      transitions.splice(index + 1, 0, transition);
-    }
+  addTransition(transition: AnimatorStateTransition): AnimatorStateTransition;
+  /**
+   * Add an outgoing transition to the destination state.
+   * @param animatorState - The destination state
+   */
+  addTransition(animatorState: AnimatorState): AnimatorStateTransition;
+
+  addTransition(transitionOrAnimatorState: AnimatorStateTransition | AnimatorState): AnimatorStateTransition {
+    return this._transitionCollection.add(transitionOrAnimatorState);
   }
 
+  /**
+   * Add an outgoing transition to exit of the stateMachine.
+   * @param exitTime - The time at which the transition can take effect. This is represented in normalized time.
+   */
+  addExitTransition(exitTime: number = 1.0): AnimatorStateTransition {
+    const transition = new AnimatorStateTransition();
+    transition._isExit = true;
+    transition.exitTime = exitTime;
+
+    return this._transitionCollection.add(transition);
+  }
   /**
    * Remove a transition from the state.
    * @param transition - The transition
    */
   removeTransition(transition: AnimatorStateTransition): void {
-    const index = this._transitions.indexOf(transition);
-    index !== -1 && this._transitions.splice(index, 1);
+    this._transitionCollection.remove(transition);
+    if (transition._isExit) {
+      transition._isExit = false;
+    }
   }
 
   /**
@@ -141,7 +153,7 @@ export class AnimatorState {
    * Clears all transitions from the state.
    */
   clearTransitions(): void {
-    this._transitions.length = 0;
+    this._transitionCollection.clear();
   }
 
   /**
@@ -178,5 +190,19 @@ export class AnimatorState {
    */
   _onClipChanged(): void {
     this._updateFlagManager.dispatch();
+  }
+
+  /**
+   * @internal
+   */
+  _getClipActualStartTime(): number {
+    return this._clipStartTime * this.clip.length;
+  }
+
+  /**
+   * @internal
+   */
+  _getClipActualEndTime(): number {
+    return this._clipEndTime * this.clip.length;
   }
 }

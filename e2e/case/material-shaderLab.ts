@@ -18,7 +18,7 @@ import {
   VertexElementFormat,
   WebGLEngine
 } from "@galacean/engine";
-import { ShaderLab } from "@galacean/engine-shader-lab";
+import { ShaderLab } from "@galacean/engine-shaderlab";
 import { initScreenshot, updateForE2E } from "./.mockForE2E";
 
 const shaderLab = new ShaderLab();
@@ -31,11 +31,11 @@ const normalShaderSource = `Shader "Triangle" {
 
       struct a2v {
         vec4 POSITION;
-      }
+      };
 
       struct v2f {
         vec3 v_color;
-      }
+      };
 
       VertexShader = vert;
       FragmentShader = frag;

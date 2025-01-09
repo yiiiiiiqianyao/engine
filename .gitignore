@@ -14,7 +14,6 @@ types
 /boilerplates/*/node_modules
 lib
 dist
-dist-miniprogram
 coverage
 .nyc_output
 npm-debug.log*
@@ -35,3 +34,7 @@ e2e/.dev/mpa
 .husky/post-commit
 .husky/pre-push
 .husky/post-merge
+
+# For bison generated files used by ShaderLab
+*.tab.c
+*.output
